@@ -627,7 +627,6 @@ statement error pgcode 42809 "privsview" is not a table
 ALTER TABLE privsview ADD d INT
 
 statement error pgcode 42809 "privsview" is not a table
-ALTER TABLE privsview SPLIT AT VALUES (42)
 
 statement ok
 CREATE TABLE s (k1 INT, k2 INT, v INT, PRIMARY KEY (k1,k2))
@@ -663,3 +662,6 @@ query I
 SELECT COUNT(*) FROM crdb_internal.jobs WHERE status = 'pending' OR status = 'started'
 ----
 0
+
+statement error constraint cannot be marked NOT VALID
+ALTER TABLE privs ADD CONSTRAINT bar UNIQUE (c) NOT VALID

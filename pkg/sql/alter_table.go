@@ -124,6 +124,13 @@ func (n *alterTableNode) Start(params runParams) error {
 			if err != nil {
 				return err
 			}
+			if t.ValidationBehavior == tree.ValidationSkip {
+				switch t.ConstraintDef.(type) {
+				case *tree.ForeignKeyConstraintTableDef:
+				default:
+					return errors.New("constraint cannot be marked NOT VALID")
+				}
+			}
 			inuseNames := make(map[string]struct{}, len(info))
 			for k := range info {
 				inuseNames[k] = struct{}{}
@@ -165,9 +172,21 @@ func (n *alterTableNode) Start(params runParams) error {
 					return err
 				}
 				affected := make(map[sqlbase.ID]*sqlbase.TableDescriptor)
-				err := params.p.resolveFK(params.ctx, n.tableDesc, d, affected, sqlbase.ConstraintValidity_Unvalidated)
+				var validity sqlbase.ConstraintValidity
+				switch t.ValidationBehavior {
+				case tree.ValidationDefault:
+					validity = sqlbase.ConstraintValidity_Validated
+				case tree.ValidationSkip:
+					validity = sqlbase.ConstraintValidity_Unvalidated
+				}
+				// err := params.p.resolveFK(params.ctx, n.tableDesc, d, affected, sqlbase.ConstraintValidity_Unvalidated)
+				srcIdx, err := params.p.resolveFK(params.ctx, n.tableDesc, d, affected, validity)
 				if err != nil {
 					return err
+				}
+				if t.ValidationBehavior == tree.ValidationDefault {
+					if err := params.p.validateForeignKey(params.ctx, n.tableDesc, srcIdx); err != nil {
+					}
 				}
 				descriptorChanged = true
 				for _, updated := range affected {
