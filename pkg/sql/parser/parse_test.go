@@ -435,7 +435,11 @@ func TestParse(t *testing.T) {
 		{`SELECT DATE 'foo'`},
 		{`SELECT TIMESTAMP 'foo'`},
 		{`SELECT TIMESTAMP WITH TIME ZONE 'foo'`},
-		{`SELECT CHAR 'foo'`},
+		{`SELECT TEXT 'foo'`},
+		{`SELECT TEXT('foo')`},
+		{`SELECT TEXT(1)`},
+		{`SELECT UUID 'foo'`},
+		{`SELECT UUID('foo')`},
 
 		{`SELECT 'a' AS "12345"`},
 		{`SELECT 'a' AS clnm`},
