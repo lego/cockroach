@@ -17,6 +17,7 @@ package sqlbase
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -826,6 +827,52 @@ func (desc *TableDescriptor) Validate(ctx context.Context, txn *client.Txn) erro
 	return desc.validateCrossReferences(ctx, txn)
 }
 
+// ValidateFull validates that the table descriptor is well formed as well
+// (through Validate()) as well as checking:
+//  - Indexes refer to valid columns
+//  - ParentID is a valid database
+//  - Column families refer to valid columns
+//  - View descriptors have: valid column types; valid number of rows; valid SQL
+func (desc *TableDescriptor) ValidateFull(ctx context.Context, txn *client.Txn) error {
+	err := desc.Validate()
+	if err != nil {
+		return err
+	}
+	// TODO(joey): Validate the ParentID. Where can the DB decriptor be pulled
+	// from?
+
+	err = desc.validateIndex(desc.PrimaryIndex)
+	if err != nil {
+		return err
+	}
+
+	for _, index := range desc.Indexes {
+		err = desc.validateIndex(index)
+		if err != nil {
+			return err
+		}
+	}
+
+	// err = desc.validateColumnFamilies()
+	// if err != nil {
+	// 	return err
+	// }
+	// return desc.validateViewDescriptor()
+	return nil
+}
+
+// validateIndex validates an index, checking:
+//  - ColumnIDs refer to valid columns, and matches the ColumnNames
+//  - StoreColumnIDs refer to valid, and matches the StoreColumnNames
+//  - Interleave descriptor is valid.
+//  - InterleavedBy reflects the same information in the foreign table.
+//  - ExtraColumnIDs refer to valid columns.
+func (desc *TableDescriptor) validateIndex(index IndexDescriptor) error {
+	for i, colID := range index.ColumnIDs {
+
+	}
+}
+
 // validateCrossReferences validates that each reference to another table is
 // resolvable and that the necessary back references exist.
 func (desc *TableDescriptor) validateCrossReferences(ctx context.Context, txn *client.Txn) error {
@@ -1148,14 +1195,13 @@ func (desc *TableDescriptor) validateColumnFamilies(
 func (desc *TableDescriptor) validateTableIndexes(
 	columnNames map[string]ColumnID, colIDToFamilyID map[ColumnID]FamilyID,
 ) error {
-	// TODO(pmattis): Check that the indexes are unique. That is, no 2 indexes
-	// should contain identical sets of columns.
 	if len(desc.PrimaryIndex.ColumnIDs) == 0 {
 		return ErrMissingPrimaryKey
 	}
 
 	indexNames := map[string]struct{}{}
 	indexIDs := map[IndexID]string{}
+	indexesInvolvedColumns := map[string]string{}
 	for _, index := range desc.AllNonDropIndexes() {
 		if err := validateName(index.Name, "index"); err != nil {
 			return err
@@ -1198,6 +1244,7 @@ func (desc *TableDescriptor) validateTableIndexes(
 			return fmt.Errorf("index %q must contain at least 1 column", index.Name)
 		}
 
+		indexInvolvedColumns := ""
 		for i, name := range index.ColumnNames {
 			colID, ok := columnNames[name]
 			if !ok {
@@ -1207,7 +1254,17 @@ func (desc *TableDescriptor) validateTableIndexes(
 				return fmt.Errorf("index %q column %q should have ID %d, but found ID %d",
 					index.Name, name, colID, index.ColumnIDs[i])
 			}
+
+			if len(indexInvolvedColumns) > 0 {
+				indexInvolvedColumns += ","
+			}
+			indexInvolvedColumns += strconv.Itoa(index.ColumnIDs[i])
 		}
+
+		if otherIndexName, ok := indexesInvolvedColumns[indexInvolvedColumns]; ok {
+			return fmt.Errorf("duplicate indexes with the same columns: %q and %q", index.Name, otherIndexName)
+		}
+		indexesInvolvedColumns[indexInvolvedColumns] = index.Name
 	}
 
 	for _, colID := range desc.PrimaryIndex.ColumnIDs {
