@@ -43,6 +43,7 @@
 		HashJoinerSpec
 		AggregatorSpec
 		BackfillerSpec
+		CheckerSpec
 		FlowSpec
 		AlgebraicSetOpSpec
 		ReadCSVSpec

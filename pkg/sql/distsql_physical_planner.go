@@ -884,6 +884,69 @@ func (dsp *distSQLPlanner) CreateBackfiller(
 	return p, nil
 }
 
+// FIXME(joey): implement
+func initCheckerSpec(
+	checkType checkType,
+	desc sqlbase.TableDescriptor,
+	chunkSize int64,
+) (distsqlrun.CheckerSpec, error) {
+	ret := distsqlrun.CheckerSpec{
+		Table:     desc,
+		ChunkSize: chunkSize,
+	}
+	switch checkType {
+	case indexCheck:
+		ret.Type = distsqlrun.CheckerSpec_Index
+	case validityCheck:
+		ret.Type = distsqlrun.CheckerSpec_Validity
+	default:
+		return distsqlrun.CheckerSpec{}, errors.Errorf("bad backfill type %d", checkType)
+	}
+	return ret, nil
+}
+
+// FIXME(joey): implement
+func (dsp *distSQLPlanner) CreateDatabaseChecker(
+	planCtx *planningCtx,
+	checkType checkType,
+	desc sqlbase.TableDescriptor,
+	chunkSize int64,
+	spans []roachpb.Span,
+) (physicalPlan, error) {
+	spec, err := initCheckerSpec(checkType, desc, chunkSize)
+	if err != nil {
+		return physicalPlan{}, err
+	}
+
+	spanPartitions, err := dsp.partitionSpans(planCtx, spans)
+	if err != nil {
+		return physicalPlan{}, err
+	}
+
+	p := physicalPlan{}
+	for _, sp := range spanPartitions {
+		ib := &distsqlrun.CheckerSpec{}
+		*ib = spec
+		ib.Spans = make([]distsqlrun.TableReaderSpan, len(sp.spans))
+		for i := range sp.spans {
+			ib.Spans[i].Span = sp.spans[i]
+		}
+
+		proc := distsqlplan.Processor{
+			Node: sp.node,
+			Spec: distsqlrun.ProcessorSpec{
+				Core:   distsqlrun.ProcessorCoreUnion{Checker: ib},
+				Output: []distsqlrun.OutputRouterSpec{{Type: distsqlrun.OutputRouterSpec_PASS_THROUGH}},
+			},
+		}
+
+		pIdx := p.AddProcessor(proc)
+		p.ResultRouters = append(p.ResultRouters, pIdx)
+	}
+	dsp.FinalizePlan(planCtx, &p)
+	return p, nil
+}
+
 // DistLoader uses DistSQL to convert external data formats (csv, etc) into
 // sstables of our mvcc-format key values.
 type DistLoader struct {

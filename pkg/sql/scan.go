@@ -122,7 +122,7 @@ func (n *scanNode) disableBatchLimit() {
 	n.softLimit = 0
 }
 
-func (n *scanNode) Start(runParams) error {
+func (n *scanNode) Start(params runParams) error {
 	return n.fetcher.Init(n.desc, n.colIdxMap, n.index, n.reverse, n.isSecondaryIndex, n.cols,
 		n.valNeededForCol, false /* returnRangeInfo */, &n.p.alloc)
 }

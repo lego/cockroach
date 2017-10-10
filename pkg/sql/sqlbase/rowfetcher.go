@@ -85,6 +85,8 @@ type RowFetcher struct {
 	// when beginning a new scan.
 	traceKV bool
 
+	txn *client.Txn
+
 	// -- Fields updated during a scan --
 
 	kvFetcher      kvFetcher
@@ -233,6 +235,7 @@ func (rf *RowFetcher) StartScan(
 	if err != nil {
 		return err
 	}
+	rf.txn = txn
 	return rf.StartScanFrom(ctx, &f)
 }
 
@@ -612,6 +615,116 @@ func (rf *RowFetcher) NextRowDecoded(ctx context.Context, traceKV bool) (parser.
 		return nil, err
 	}
 	return rf.decodedRow, nil
+}
+
+// NextRowFailure calls NextRow to fetch the next row and runs physical checks.
+// It will return the next failure encountered. The checks ran include:
+//  - The KV pair data round-trips (decodes and re-encodes to the same value).
+//  - Any secondary index columns have corresponding entries.
+//  - There is no extra data encoded into the KV pair.
+// The Datums should not be modified and is only valid until the next call.
+// When there are no more rows, the Datums is nil.
+func (rf *RowFetcher) NextRowFailure(ctx context.Context, traceKV bool) (parser.Datums, error) {
+	encRow, err := rf.NextRow(ctx)
+	// FIXME(joey): This is where we encounter any key errors.
+	if err != nil {
+		return nil, err
+	}
+	if encRow == nil {
+		return nil, nil
+	}
+	err = EncDatumRowToDatums(rf.decodedRow, encRow, rf.alloc)
+	// FIXME(joey): This is where we encounter any value errors.
+	if err != nil {
+		return nil, err
+	}
+	err = rf.checkSecondaryIndexes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rf.checkDatumEncodings(ctx)
+	// FIXME(joey): Track the last key prefix and it's decoded values and
+	// check the ordering (last <= current else error) for each portion.
+	return rf.decodedRow, nil
+}
+
+func (rf *RowFetcher) checkSecondaryIndexes(ctx context.Context) error {
+	for _, index := range rf.desc.Indexes {
+		fetchColIDtoRowIndex := ColIDtoRowIndexFromCols(rf.desc.Columns)
+		secondaryIndexKey, err := EncodeSecondaryIndex(rf.desc, &index, fetchColIDtoRowIndex, rf.decodedRow)
+		if err != nil {
+			log.VEventf(ctx, 2, "failed to encode secondary idx: %s", err)
+			log.VEventf(ctx, 2, "  index=%#v", index)
+			log.VEventf(ctx, 2, "  fetchColIDtoRowIndex=%#v", fetchColIDtoRowIndex)
+			log.VEventf(ctx, 2, "  decodedRow=%#v", rf.decodedRow)
+		} else {
+			log.VEventf(ctx, 2, "encoded secondary idx: %s", secondaryIndexKey)
+			if result, err := rf.txn.Get(ctx, secondaryIndexKey.Key); err != nil {
+				log.VEventf(ctx, 2, "failed to retrieve secondary key: %s", err)
+			} else if result.Value != nil {
+				log.VEventf(ctx, 2, "GOT SECONDARY KEY: %#v", result)
+			} else {
+				log.Errorf(ctx, "Could not find secondary key at %s", secondaryIndexKey.Key)
+				// return errors.Errorf("Failed to find secondary index key at %s", secondaryIndexKey.Key)
+			}
+		}
+	}
+	return nil
+}
+
+func contains(columns []ColumnID, c ColumnID) bool {
+	for _, col := range columns {
+		if col == c {
+			return true
+		}
+	}
+	return false
+}
+
+func (rf *RowFetcher) checkDatumEncodings(ctx context.Context) {
+	scratch := make([]byte, 1024)
+	for i, col := range rf.cols {
+		rowVal := rf.row[i]
+		if rf.neededCols.Contains(int(col.ID)) && !rowVal.IsUnset() {
+			if contains(rf.index.ColumnIDs, col.ID) || contains(rf.index.ExtraColumnIDs, col.ID) {
+				// Skip row values involving indexes as the bytes don't exist here.
+				continue
+			} else if err := rowVal.EnsureDecoded(rf.alloc); err != nil {
+				log.Error(ctx, errors.Wrapf(err, "Attempted EncDatum.EnsureDecoded"))
+				continue
+			}
+
+			if result, err := EncodeTableValue([]byte(nil), col.ID, rowVal.Datum, scratch); err != nil {
+				log.Errorf(ctx, "Could not re-encode column %s, value was %#v. Got error %s", col.Name, rowVal.Datum, err)
+			} else if !bytes.Equal(result, rowVal.encoded) {
+				log.Errorf(ctx, "Value did not round-trip. Column=%s. Key=%s. InputEncDatum=%#v got %s", col.Name, rf.kv.Key, rowVal, result)
+			}
+		}
+	}
+
+	for i, keyVal := range rf.keyVals {
+		if err := keyVal.EnsureDecoded(rf.alloc); err != nil {
+			log.Error(ctx, errors.Wrapf(err, "Attempted EncDatum.EnsureDecoded"))
+			continue
+		}
+		if result, err := EncodeTableKey([]byte(nil), keyVal.Datum, rf.indexColumnDirs[i]); err != nil {
+			log.Errorf(ctx, "Could not re-encode key value of key %d, value was %#v. Got error %s", i, keyVal.Datum, err)
+		} else if !bytes.Equal(result, keyVal.encoded) {
+			log.Errorf(ctx, "Value did not round-trip key %d. InputEncDatum=%#v got %s", i, keyVal, result)
+		}
+	}
+
+	for i, keyVal := range rf.extraVals {
+		if err := keyVal.EnsureDecoded(rf.alloc); err != nil {
+			log.Error(ctx, errors.Wrapf(err, "Attempted EncDatum.EnsureDecoded"))
+			continue
+		}
+		if result, err := EncodeTableKey([]byte(nil), keyVal.Datum, rf.indexColumnDirs[i]); err != nil {
+			log.Errorf(ctx, "Could not re-encode extra key value of key %d, value was %#v. Got error %s", i, keyVal.Datum, err)
+		} else if !bytes.Equal(result, keyVal.encoded) {
+			log.Errorf(ctx, "Value did not round-trip extra key val %d. InputEncDatum=%#v got %s", i, keyVal, result)
+		}
+	}
 }
 
 func (rf *RowFetcher) finalizeRow() {

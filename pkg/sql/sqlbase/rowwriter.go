@@ -64,10 +64,12 @@ func (rh *rowHelper) encodeIndexes(
 	if err != nil {
 		return nil, nil, err
 	}
-	secondaryIndexEntries, err = rh.encodeSecondaryIndexes(colIDtoRowIndex, values)
-	if err != nil {
-		return nil, nil, err
-	}
+	// FIXME(joey): This is commented out to prevent creating secondary indexes on
+	// row creation.
+	// secondaryIndexEntries, err = rh.encodeSecondaryIndexes(colIDtoRowIndex, values)
+	// if err != nil {
+	// 	return nil, nil, err
+	// }
 	return primaryIndexKey, secondaryIndexEntries, nil
 }
 
@@ -611,11 +613,13 @@ func (ru *RowUpdater) UpdateRow(
 		}
 		rowPrimaryKeyChanged = !bytes.Equal(primaryIndexKey, newPrimaryIndexKey)
 	} else {
-		newSecondaryIndexEntries, err =
-			ru.Helper.encodeSecondaryIndexes(ru.FetchColIDtoRowIndex, ru.newValues)
-		if err != nil {
-			return nil, err
-		}
+		// FIXME(joey): This was commented out to prevent secondary index updating
+		// during row value updating.
+		// newSecondaryIndexEntries, err =
+		// 	ru.Helper.encodeSecondaryIndexes(ru.FetchColIDtoRowIndex, ru.newValues)
+		// if err != nil {
+		// 	return nil, err
+		// }
 	}
 
 	if rowPrimaryKeyChanged {
