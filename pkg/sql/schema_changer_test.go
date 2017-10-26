@@ -1390,7 +1390,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 }
 
-// Test schema change purge failure doesn't leave DB in a bad state.
+// Test schema change rollback failure doesn't leave DB in a bad state.
 func TestSchemaChangePurgeFailure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := createTestServerParams()
@@ -1400,8 +1400,8 @@ func TestSchemaChangePurgeFailure(t *testing.T) {
 	attempts := 0
 	// attempt 1: write the first chunk of the index.
 	// attempt 2: write the second chunk and hit a unique constraint
-	// violation; purge the schema change.
-	// attempt 3: return an error while purging the schema change.
+	// violation; rollback the schema change.
+	// attempt 3: return an error while rolling back the schema change.
 	expectedAttempts := 3
 	params.Knobs = base.TestingKnobs{
 		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
@@ -1421,7 +1421,7 @@ func TestSchemaChangePurgeFailure(t *testing.T) {
 				return nil
 			},
 			// Speed up evaluation of async schema changes so that it
-			// processes a purged schema change quickly.
+			// processes a rollbacked schema change quickly.
 			AsyncExecQuickly:  true,
 			BackfillChunkSize: chunkSize,
 		},
@@ -1466,8 +1466,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	); !testutils.IsError(err, "violates unique constraint") {
 		t.Fatal(err)
 	}
-	// The deadline exceeded error in the schema change purge results in no
-	// retry attempts of the purge.
+	// The deadline exceeded error in the schema change rollback results in no
+	// retry attempts of the rollback.
 	if attempts != expectedAttempts {
 		t.Fatalf("%d retries, despite allowing only (schema change + reverse) = %d", attempts, expectedAttempts)
 	}
@@ -1491,7 +1491,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		t.Fatalf("the table has mutation %v instead of a DROP", tableDesc.Mutations[0])
 	}
 
-	// There is still some garbage index data that needs to be purged. All the
+	// There is still some garbage index data that needs to be rollbacked. All the
 	// rows from k = 0 to k = maxValue have index values. The k = maxValue + 1
 	// row with the conflict doesn't contain an index value.
 	numGarbageValues := chunkSize
@@ -1574,13 +1574,13 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		t.Fatal(err)
 	}
 
-	// Add an index over a column that will be purged. This index will
+	// Add an index over a column that will be rollbacked. This index will
 	// eventually not get added.
 	if _, err := sqlDB.Exec(`CREATE UNIQUE INDEX idx_a ON t.test (a)`); err != nil {
 		t.Fatal(err)
 	}
 
-	// The purge of column 'a' doesn't influence these schema changes.
+	// The rollback of column 'a' doesn't influence these schema changes.
 
 	// Drop column 'v' moves along just fine. The constraint 'foo' will not be
 	// enforced because c is not added.
@@ -1679,7 +1679,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	// Check that the index on b eventually goes live even though a schema
-	// change in front of it in the queue got purged.
+	// change in front of it in the queue got rollbacked.
 	rows, err := sqlDB.Query(`SELECT * from t.test@test_b_key`)
 	if err != nil {
 		t.Fatal(err)
@@ -1695,7 +1695,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		t.Fatalf("read the wrong number of rows: e = %d, v = %d", eCount, count)
 	}
 
-	// Check that the index on c gets purged.
+	// Check that the index on c gets rollbacked.
 	if _, err = sqlDB.Query(`SELECT * from t.test@foo`); err == nil {
 		t.Fatal("SELECT over index 'foo' works")
 	}
