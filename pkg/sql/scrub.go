@@ -112,6 +112,7 @@ func (n *scrubNode) Start(params runParams) error {
 
 	// Process SCRUB options
 	var indexesSet bool
+	var physical bool
 	for _, option := range n.n.Options {
 		switch v := option.(type) {
 		case *parser.ScrubOptionIndex:
@@ -124,6 +125,12 @@ func (n *scrubNode) Start(params runParams) error {
 				return err
 			}
 			indexesSet = true
+		case *parser.ScrubOptionPhysical:
+			if physical == true {
+				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+					"cannot specify PHYSICAL option more than once")
+			}
+			physical = true
 		default:
 			panic(fmt.Sprintf("Unhandled SCRUB option received: %+v", v))
 		}
@@ -135,6 +142,7 @@ func (n *scrubNode) Start(params runParams) error {
 		if err != nil {
 			return err
 		}
+		physical = true
 	}
 
 	return nil
