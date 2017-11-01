@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
@@ -41,12 +42,47 @@ const (
 type scrubNode struct {
 	optColumnsSlot
 
-	n         *parser.Scrub
-	indexes   []sqlbase.IndexDescriptor
-	tableDesc *sqlbase.TableDescriptor
-	tableName *parser.TableName
+	n             *parser.Scrub
+	indexes       []sqlbase.IndexDescriptor
+	physicalCheck bool
+	tableDesc     *sqlbase.TableDescriptor
+	tableName     *parser.TableName
 
 	currentIndex *checkedIndex
+
+	currentPhysicalCheck struct {
+		// Intermediate values.
+		rows     *sqlbase.RowContainer
+		rowIndex int
+
+		// Context of the index check.
+		databaseName string
+		tableName    string
+		indexName    string
+		// columns is a list of the columns returned in the query result
+		// parser.Datums.
+		columns []*sqlbase.ColumnDescriptor
+		// primaryIndexColumnIndexes maps PrimaryIndex.Columns to the row
+		// indexes in the query result parser.Datums.
+		primaryIndexColumnIndexes []int
+	}
+
+	physicalCheck struct {
+		// Intermediate values.
+		rows     *sqlbase.RowContainer
+		rowIndex int
+
+		// Context of the index check.
+		databaseName string
+		tableName    string
+		indexName    string
+		// columns is a list of the columns returned in the query result
+		// parser.Datums.
+		columns []*sqlbase.ColumnDescriptor
+		// primaryIndexColumnIndexes maps PrimaryIndex.Columns to the row
+		// indexes in the query result parser.Datums.
+		primaryIndexColumnIndexes []int
+	}
 
 	row parser.Datums
 }
@@ -112,7 +148,6 @@ func (n *scrubNode) Start(params runParams) error {
 
 	// Process SCRUB options
 	var indexesSet bool
-	var physical bool
 	for _, option := range n.n.Options {
 		switch v := option.(type) {
 		case *parser.ScrubOptionIndex:
@@ -126,11 +161,11 @@ func (n *scrubNode) Start(params runParams) error {
 			}
 			indexesSet = true
 		case *parser.ScrubOptionPhysical:
-			if physical == true {
+			if n.physicalCheck == true {
 				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
 					"cannot specify PHYSICAL option more than once")
 			}
-			physical = true
+			n.physicalCheck = true
 		default:
 			panic(fmt.Sprintf("Unhandled SCRUB option received: %+v", v))
 		}
@@ -142,7 +177,6 @@ func (n *scrubNode) Start(params runParams) error {
 		if err != nil {
 			return err
 		}
-		physical = true
 	}
 
 	return nil
@@ -398,6 +432,250 @@ func createIndexCheckQuery(
 	)
 }
 
+// startPhysicalCheck will plan and run the physical data check using
+// the distSQL execution engine.
+func (n *scrubNode) startPhysicalCheck(
+	ctx context.Context,
+	p *planner,
+	tableDesc *sqlbase.TableDescriptor,
+	indexDesc *sqlbase.IndexDescriptor,
+) error {
+	colToIdx := make(map[sqlbase.ColumnID]int)
+	for i, col := range tableDesc.Columns {
+		colToIdx[col.ID] = i
+	}
+
+	// Collect all of the columns, their types, and their IDs.
+	columns := []*sqlbase.ColumnDescriptor(nil)
+	columnTypes := []sqlbase.ColumnType(nil)
+	columnIDs := []parser.ColumnID(nil)
+
+	log.Errorf(ctx, "indexID=%#v", indexDesc.ID)
+	if indexDesc.ID == tableDesc.PrimaryIndex.ID {
+		for i := range tableDesc.Columns {
+			columns = append(columns, &tableDesc.Columns[i])
+		}
+	} else {
+		log.Errorf(ctx, "secondary indexes")
+		// FIXME(joey): If this is a secondary index, only get the columns
+		// contained by the index.
+	}
+
+	for _, col := range columns {
+		columnTypes = append(columnTypes, col.Type)
+		columnIDs = append(columnIDs, parser.ColumnID(col.ID))
+	}
+
+	log.Errorf(ctx, "columns=%#v", columns)
+	log.Errorf(ctx, "columnTypes=%#v", columnTypes)
+	log.Errorf(ctx, "columnIDs=%#v", columnIDs)
+
+	// Find the row indexes for all of the primary index columns.
+	primaryColumnRowIndexes := []int(nil)
+	for i, colID := range tableDesc.PrimaryIndex.ColumnIDs {
+		rowIdx := -1
+		for idx, col := range columns {
+			if col.ID == colID {
+				rowIdx = idx
+				break
+			}
+		}
+		// FIXME(joey): This is a bit of defensive programming, in the event
+		// the IndexDescriptor doesn't contain all primary index columns. Is
+		// this really necessary?
+		if rowIdx == -1 {
+			return errors.Errorf(
+				"could not find primary index column in projection: columnID=%d columnName=%s",
+				colID,
+				tableDesc.PrimaryIndex.ColumnNames[i])
+		}
+		primaryColumnRowIndexes = append(primaryColumnRowIndexes, rowIdx)
+	}
+
+	indexHints := &parser.IndexHints{
+		IndexID:       parser.IndexID(indexDesc.ID),
+		NoIndexJoin:   true,
+		PhysicalCheck: true,
+	}
+	scan := p.Scan()
+	if err := scan.initTable(p, tableDesc, indexHints, publicColumns, columnIDs); err != nil {
+		return err
+	}
+	plan := planNode(scan)
+
+	// Optimize the plan. This is required in order to populate scanNode
+	// spans.
+	plan, err := p.optimizePlan(ctx, plan, allColumns(plan))
+	if err != nil {
+		plan.Close(ctx)
+		return err
+	}
+	defer plan.Close(ctx)
+
+	ci := sqlbase.ColTypeInfoFromColTypes(columnTypes)
+	// FIXME(joey): Usage of rows.Close() may be incorrect. Currently it is:
+	// - Closed after reading the rows
+	// - Closed if an error is received, and we don't expect rows, or use the container.
+	rows := sqlbase.NewRowContainer(*p.evalCtx.ActiveMemAcc, ci, 0)
+	rowResultWriter := NewRowResultWriter(parser.Rows, rows)
+	recv, err := makeDistSQLReceiver(
+		ctx,
+		rowResultWriter,
+		nil, /* rangeCache */
+		nil, /* leaseCache */
+		p.txn,
+		nil, /* updateClock */
+	)
+	if err != nil {
+		rows.Close(ctx)
+		return err
+	}
+
+	err = p.session.distSQLPlanner.PlanAndRun(ctx, p.txn, plan, &recv, p.evalCtx)
+	if err != nil {
+		rows.Close(ctx)
+		return err
+	} else if recv.err != nil {
+		rows.Close(ctx)
+		return recv.err
+	}
+
+	if rows.Len() > 0 {
+		n.physicalCheck.rows = rows
+		n.physicalCheck.tableName = tableDesc.Name
+		n.physicalCheck.databaseName = p.session.Database
+		n.physicalCheck.indexName = indexDesc.Name
+		n.physicalCheck.primaryIndexColumnIndexes = primaryColumnRowIndexes
+		n.physicalCheck.columns = columns
+	} else {
+		rows.Close(ctx)
+	}
+
+	return nil
+}
+
+// startPhysicalCheck will plan and run the physical data check using
+// the distSQL execution engine.
+func (n *scrubNode) startPhysicalCheck(
+	ctx context.Context,
+	p *planner,
+	tableDesc *sqlbase.TableDescriptor,
+	indexDesc *sqlbase.IndexDescriptor,
+) error {
+	colToIdx := make(map[sqlbase.ColumnID]int)
+	for i, col := range tableDesc.Columns {
+		colToIdx[col.ID] = i
+	}
+
+	// Collect all of the columns, their types, and their IDs.
+	columns := []*sqlbase.ColumnDescriptor(nil)
+	columnTypes := []sqlbase.ColumnType(nil)
+	columnIDs := []parser.ColumnID(nil)
+
+	log.Errorf(ctx, "indexID=%#v", indexDesc.ID)
+	if indexDesc.ID == tableDesc.PrimaryIndex.ID {
+		for i := range tableDesc.Columns {
+			columns = append(columns, &tableDesc.Columns[i])
+		}
+	} else {
+		log.Errorf(ctx, "secondary indexes")
+		// FIXME(joey): If this is a secondary index, only get the columns
+		// contained by the index.
+	}
+
+	for _, col := range columns {
+		columnTypes = append(columnTypes, col.Type)
+		columnIDs = append(columnIDs, parser.ColumnID(col.ID))
+	}
+
+	log.Errorf(ctx, "columns=%#v", columns)
+	log.Errorf(ctx, "columnTypes=%#v", columnTypes)
+	log.Errorf(ctx, "columnIDs=%#v", columnIDs)
+
+	// Find the row indexes for all of the primary index columns.
+	primaryColumnRowIndexes := []int(nil)
+	for i, colID := range tableDesc.PrimaryIndex.ColumnIDs {
+		rowIdx := -1
+		for idx, col := range columns {
+			if col.ID == colID {
+				rowIdx = idx
+				break
+			}
+		}
+		// FIXME(joey): This is a bit of defensive programming, in the event
+		// the IndexDescriptor doesn't contain all primary index columns. Is
+		// this really necessary?
+		if rowIdx == -1 {
+			return errors.Errorf(
+				"could not find primary index column in projection: columnID=%d columnName=%s",
+				colID,
+				tableDesc.PrimaryIndex.ColumnNames[i])
+		}
+		primaryColumnRowIndexes = append(primaryColumnRowIndexes, rowIdx)
+	}
+
+	indexHints := &parser.IndexHints{
+		IndexID:       parser.IndexID(indexDesc.ID),
+		NoIndexJoin:   true,
+		PhysicalCheck: true,
+	}
+	scan := p.Scan()
+	if err := scan.initTable(p, tableDesc, indexHints, publicColumns, columnIDs); err != nil {
+		return err
+	}
+	plan := planNode(scan)
+
+	// Optimize the plan. This is required in order to populate scanNode
+	// spans.
+	plan, err := p.optimizePlan(ctx, plan, allColumns(plan))
+	if err != nil {
+		plan.Close(ctx)
+		return err
+	}
+	defer plan.Close(ctx)
+
+	ci := sqlbase.ColTypeInfoFromColTypes(columnTypes)
+	// FIXME(joey): Usage of rows.Close() may be incorrect. Currently it is:
+	// - Closed after reading the rows
+	// - Closed if an error is received, and we don't expect rows, or use the container.
+	rows := sqlbase.NewRowContainer(*p.evalCtx.ActiveMemAcc, ci, 0)
+	rowResultWriter := NewRowResultWriter(parser.Rows, rows)
+	recv, err := makeDistSQLReceiver(
+		ctx,
+		rowResultWriter,
+		nil, /* rangeCache */
+		nil, /* leaseCache */
+		p.txn,
+		nil, /* updateClock */
+	)
+	if err != nil {
+		rows.Close(ctx)
+		return err
+	}
+
+	err = p.session.distSQLPlanner.PlanAndRun(ctx, p.txn, plan, &recv, p.evalCtx)
+	if err != nil {
+		rows.Close(ctx)
+		return err
+	} else if recv.err != nil {
+		rows.Close(ctx)
+		return recv.err
+	}
+
+	if rows.Len() > 0 {
+		n.physicalCheck.rows = rows
+		n.physicalCheck.tableName = tableDesc.Name
+		n.physicalCheck.databaseName = p.session.Database
+		n.physicalCheck.indexName = indexDesc.Name
+		n.physicalCheck.primaryIndexColumnIndexes = primaryColumnRowIndexes
+		n.physicalCheck.columns = columns
+	} else {
+		rows.Close(ctx)
+	}
+
+	return nil
+}
+
 // indexesToCheck will return all of the indexes that are being checked.
 // If indexNames is nil, then all indexes are returned.
 // TODO(joey): This can be simplified with
@@ -463,6 +741,34 @@ func (n *scrubNode) Next(params runParams) (bool, error) {
 		if n.currentIndex.rowIndex >= n.currentIndex.rows.Len() {
 			n.currentIndex.rows.Close(params.ctx)
 			n.currentIndex = nil
+		}
+		return true, nil
+	}
+
+	// Begin the physical check query. It is planned then executed in the
+	// distSQL execution engine.
+	if n.physicalCheck == false && n.currentPhysicalCheck == nil {
+		n.currentPhysicalCheck, err = n.startPhysicalCheck(
+			params.ctx, params.p, n.tableDesc, n.tableName, &tableDesc.PrimaryIndex)
+		if err != nil {
+			return false, err
+		}
+		n.physicalCheck = false
+	}
+
+	// If an physical check query is in progress then we will pull the rows
+	// from its buffer.
+	if n.currentPhysicalCheck != nil {
+		resultRow := n.currentPhysicalCheck.rows.At(n.currentPhysicalCheck.rowIndex)
+		// FIXME(joey): Make getNextPhysicalError
+		n.row, err = getNextPhysicalError(params.p, n.currentPhysicalCheck, resultRow)
+		if err != nil {
+			return false, err
+		}
+		n.currentPhysicalCheck.rowIndex++
+		if n.currentPhysicalCheck.rowIndex >= n.currentPhysicalCheck.rows.Len() {
+			n.currentPhysicalCheck.rows.Close(params.ctx)
+			n.currentPhysicalCheck = nil
 		}
 		return true, nil
 	}
