@@ -86,6 +86,10 @@ type RowFetcher struct {
 	// when beginning a new scan.
 	traceKV bool
 
+	// isCheck indicates whether or not we are running checks for k/v
+	// correctness. It is set only during SCRUB commands.
+	isCheck bool
+
 	// -- Fields updated during a scan --
 
 	kvFetcher      kvFetcher
@@ -127,6 +131,7 @@ func (rf *RowFetcher) Init(
 	cols []ColumnDescriptor,
 	valNeededForCol []bool,
 	returnRangeInfo bool,
+	isCheck bool,
 	alloc *DatumAlloc,
 ) error {
 	rf.desc = desc
@@ -139,6 +144,7 @@ func (rf *RowFetcher) Init(
 	rf.returnRangeInfo = returnRangeInfo
 	rf.row = make([]EncDatum, len(rf.cols))
 	rf.decodedRow = make([]parser.Datum, len(rf.cols))
+	rf.isCheck = isCheck
 	rf.alloc = alloc
 
 	for i, v := range valNeededForCol {
@@ -597,8 +603,8 @@ func (rf *RowFetcher) NextRow(ctx context.Context) (EncDatumRow, error) {
 			return nil, err
 		}
 		if rowDone {
-			rf.finalizeRow()
-			return rf.row, nil
+			err := rf.finalizeRow()
+			return rf.row, err
 		}
 	}
 }
@@ -629,17 +635,23 @@ func (rf *RowFetcher) NextRowDecoded(ctx context.Context) (parser.Datums, error)
 	return rf.decodedRow, nil
 }
 
-func (rf *RowFetcher) finalizeRow() {
+func (rf *RowFetcher) finalizeRow() error {
 	// Fill in any missing values with NULLs
 	for i := range rf.cols {
 		if rf.neededCols.Contains(int(rf.cols[i].ID)) && rf.row[i].IsUnset() {
 			if !rf.cols[i].Nullable {
-				panic(fmt.Sprintf("Non-nullable column \"%s:%s\" with no value!",
-					rf.desc.Name, rf.cols[i].Name))
+				if rf.isCheck {
+					return errors.Errorf(fmt.Sprintf("Non-nullable column \"%s:%s\" with no value!",
+						rf.desc.Name, rf.cols[i].Name))
+				} else {
+					panic(fmt.Sprintf("Non-nullable column \"%s:%s\" with no value!",
+						rf.desc.Name, rf.cols[i].Name))
+				}
 			}
 			rf.row[i] = EncDatum{Datum: parser.DNull}
 		}
 	}
+	return nil
 }
 
 // Key returns the next key (the key that follows the last returned row).
