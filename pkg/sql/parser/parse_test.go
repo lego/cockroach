@@ -490,8 +490,8 @@ func TestParse(t *testing.T) {
 		{`SELECT a.b[:][3] FROM t`},
 		{`SELECT 'a' FROM t`},
 		{`SELECT 'a' FROM t@bar`},
-		{`SELECT 'a' FROM t@{NO_INDEX_JOIN}`},
-		{`SELECT 'a' FROM t@{FORCE_INDEX=bar,NO_INDEX_JOIN}`},
+		{`SELECT 'a' FROM t@{NO_INDEX_JOIN,PHYSICAL_CHECK}`},
+		{`SELECT 'a' FROM t@{FORCE_INDEX=bar,NO_INDEX_JOIN,PHYSICAL_CHECK}`},
 		{`SELECT * FROM t AS "of" AS OF SYSTEM TIME '2016-01-01'`},
 
 		{`SELECT '1':::INT`},
@@ -864,8 +864,8 @@ func TestParse2(t *testing.T) {
 		{`SELECT CAST(1 AS "char")`, `SELECT CAST(1 AS CHAR)`},
 
 		{`SELECT 'a' FROM t@{FORCE_INDEX=bar}`, `SELECT 'a' FROM t@bar`},
-		{`SELECT 'a' FROM t@{NO_INDEX_JOIN,FORCE_INDEX=bar}`,
-			`SELECT 'a' FROM t@{FORCE_INDEX=bar,NO_INDEX_JOIN}`},
+		{`SELECT 'a' FROM t@{PHYSICAL_CHECK,NO_INDEX_JOIN,FORCE_INDEX=bar}`,
+			`SELECT 'a' FROM t@{FORCE_INDEX=bar,NO_INDEX_JOIN,PHYSICAL_CHECK}`},
 
 		{`SELECT 'a' FROM t@{FORCE_INDEX=[123]}`, `SELECT 'a' FROM t@[123]`},
 		{`SELECT 'a' FROM [123 AS t]@{FORCE_INDEX=[456]}`, `SELECT 'a' FROM [123 AS t]@[456]`},
@@ -1475,6 +1475,13 @@ SELECT a FROM foo@{NO_INDEX_JOIN,NO_INDEX_JOIN}
 			`NO_INDEX_JOIN specified multiple times at or near "no_index_join"
 SELECT a FROM foo@{NO_INDEX_JOIN,FORCE_INDEX=baz,NO_INDEX_JOIN}
                                                  ^
+`,
+		},
+		{
+			`SELECT a FROM foo@{PHYSICAL_CHECK,FORCE_INDEX=baz,PHYSICAL_CHECK}`,
+			`PHYSICAL_CHECK specified multiple times at or near "physical_check"
+SELECT a FROM foo@{PHYSICAL_CHECK,FORCE_INDEX=baz,PHYSICAL_CHECK}
+                                                  ^
 `,
 		},
 		{

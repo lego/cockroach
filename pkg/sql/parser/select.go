@@ -238,16 +238,18 @@ type IndexID uint32
 // one of:
 //  - FORCE_INDEX=<index_name>
 //  - NO_INDEX_JOIN
+//  - PHYSICAL_CHECK
 // It is used optionally after a table name in SELECT statements.
 type IndexHints struct {
-	Index       Name
-	IndexID     IndexID
-	NoIndexJoin bool
+	Index         Name
+	IndexID       IndexID
+	NoIndexJoin   bool
+	PhysicalCheck bool
 }
 
 // Format implements the NodeFormatter interface.
 func (n *IndexHints) Format(buf *bytes.Buffer, f FmtFlags) {
-	if !n.NoIndexJoin {
+	if !n.NoIndexJoin && !n.PhysicalCheck {
 		buf.WriteByte('@')
 		if n.Index != "" {
 			FormatNode(buf, f, n.Index)
@@ -255,17 +257,29 @@ func (n *IndexHints) Format(buf *bytes.Buffer, f FmtFlags) {
 			fmt.Fprintf(buf, "[%d]", n.IndexID)
 		}
 	} else {
-		if n.Index == "" && n.IndexID == 0 {
-			buf.WriteString("@{NO_INDEX_JOIN}")
-		} else {
-			buf.WriteString("@{FORCE_INDEX=")
+		buf.WriteString("@{")
+		if n.Index != "" || n.IndexID != 0 {
+			buf.WriteString("FORCE_INDEX=")
 			if n.Index != "" {
 				FormatNode(buf, f, n.Index)
 			} else {
 				fmt.Fprintf(buf, "[%d]", n.IndexID)
 			}
-			buf.WriteString(",NO_INDEX_JOIN}")
 		}
+		if n.NoIndexJoin {
+			if n.Index != "" || n.IndexID != 0 {
+				buf.WriteByte(',')
+			}
+			buf.WriteString("NO_INDEX_JOIN")
+		}
+
+		if n.PhysicalCheck {
+			if n.Index != "" || n.IndexID != 0 || n.NoIndexJoin {
+				buf.WriteByte(',')
+			}
+			buf.WriteString("PHYSICAL_CHECK")
+		}
+		buf.WriteByte('}')
 	}
 }
 

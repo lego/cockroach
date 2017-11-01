@@ -445,7 +445,7 @@ func (u *sqlSymUnion) scrubOption() ScrubOption {
 %token <str>   OF OFF OFFSET OID ON ONLY OPTIONS OR
 %token <str>   ORDER ORDINALITY OUT OUTER OVER OVERLAPS OVERLAY
 
-%token <str>   PARENT PARTIAL PARTITION PASSWORD PAUSE PHYSICAL
+%token <str>   PARENT PARTIAL PARTITION PASSWORD PAUSE PHYSICAL PHYSICAL_CHECK
 %token <str>   PLACING PLANS POSITION PRECEDING PRECISION PREPARE PRIMARY PRIORITY
 
 %token <str>   QUERIES QUERY
@@ -4275,6 +4275,10 @@ index_hints_param:
   {
      $$.val = &IndexHints{NoIndexJoin: true}
   }
+| PHYSICAL_CHECK
+  {
+     $$.val = &IndexHints{PhysicalCheck: true}
+  }
 
 index_hints_param_list:
   index_hints_param
@@ -4290,6 +4294,10 @@ index_hints_param_list:
        sqllex.Error("NO_INDEX_JOIN specified multiple times")
        return 1
     }
+    if a.PhysicalCheck && b.PhysicalCheck {
+       sqllex.Error("PHYSICAL_CHECK specified multiple times")
+       return 1
+    }
     if (a.Index != "" || a.IndexID != 0) && (b.Index != "" || b.IndexID != 0) {
        sqllex.Error("FORCE_INDEX specified multiple times")
        return 1
@@ -4301,6 +4309,7 @@ index_hints_param_list:
     a.Index = a.Index + b.Index
     a.IndexID = a.IndexID + b.IndexID
     a.NoIndexJoin = a.NoIndexJoin || b.NoIndexJoin
+    a.PhysicalCheck = a.PhysicalCheck || b.PhysicalCheck
     $$.val = a
   }
 
@@ -6679,6 +6688,7 @@ unreserved_keyword:
 | PASSWORD
 | PAUSE
 | PHYSICAL
+| PHYSICAL_CHECK
 | PLANS
 | PRECEDING
 | PREPARE

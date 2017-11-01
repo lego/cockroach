@@ -75,6 +75,10 @@ type scanNode struct {
 	lockForUpdate    bool
 	props            physicalProps
 
+	// Indicates if this scanNode will do a physical data check. This is
+	// only true when running SCRUB commands.
+	isCheck bool
+
 	rowIndex int64 // the index of the current row
 
 	// filter that can be evaluated using only this table/index; it contains

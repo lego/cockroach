@@ -1016,12 +1016,12 @@ SELECT [DISTINCT]
 		SeeAlso: `SELECT, TABLE, WEBDOCS/table-expressions.html
 `,
 	},
-	//line sql.y: 4327
+	//line sql.y: 4336
 	`<SOURCE>`: {
 		ShortDescription: `define a data source for SELECT`,
-		//line sql.y: 4328
+		//line sql.y: 4337
 		Category: hDML,
-		//line sql.y: 4329
+		//line sql.y: 4338
 		Text: `
 Data sources:
   <tablename> [ @ { <idxname> | <indexhint> } ]
@@ -1041,7 +1041,7 @@ Index hints:
   '{' NO_INDEX_JOIN [, ...] '}'
 
 `,
-		//line sql.y: 4347
+		//line sql.y: 4356
 		SeeAlso: `WEBDOCS/table-expressions.html
 `,
 	},
