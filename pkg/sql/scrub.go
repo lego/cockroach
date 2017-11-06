@@ -20,34 +20,46 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/scrub"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
-const (
-	// ScrubErrorMissingIndexEntry occurs when a primary k/v is missing a
-	// corresponding secondary index k/v.
-	ScrubErrorMissingIndexEntry = "missing_index_entry"
-	// ScrubErrorDanglingIndexReference occurs when a secondary index k/v
-	// points to a non-existing primary k/v.
-	ScrubErrorDanglingIndexReference = "dangling_index_reference"
-)
-
 type scrubNode struct {
 	optColumnsSlot
 
-	n         *parser.Scrub
-	indexes   []sqlbase.IndexDescriptor
-	tableDesc *sqlbase.TableDescriptor
-	tableName *parser.TableName
+	n             *parser.Scrub
+	indexes       []sqlbase.IndexDescriptor
+	physicalCheck bool
+	tableDesc     *sqlbase.TableDescriptor
+	tableName     *parser.TableName
 
 	currentIndex *checkedIndex
 
+	currentPhysicalCheck *physicalCheck
+
 	row parser.Datums
+}
+
+type physicalCheck struct {
+	// Intermediate values.
+	rows     *sqlbase.RowContainer
+	rowIndex int
+
+	// Context of the physical check.
+	indexName string
+	// columns is a list of the columns returned in the query result
+	// parser.Datums.
+	columns []*sqlbase.ColumnDescriptor
+	// primaryIndexColumnIndexes maps PrimaryIndex.Columns to the row
+	// indexes in the query result parser.Datums.
+	primaryIndexColumnIndexes []int
 }
 
 // checkedIndex holds the intermediate results for one index that is
@@ -110,7 +122,6 @@ func (n *scrubNode) Start(params runParams) error {
 
 	// Process SCRUB options.
 	var indexesSet bool
-	var physical bool
 	for _, option := range n.n.Options {
 		switch v := option.(type) {
 		case *parser.ScrubOptionIndex:
@@ -124,11 +135,11 @@ func (n *scrubNode) Start(params runParams) error {
 			}
 			indexesSet = true
 		case *parser.ScrubOptionPhysical:
-			if physical {
+			if n.physicalCheck {
 				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
 					"cannot specify PHYSICAL option more than once")
 			}
-			physical = true
+			n.physicalCheck = true
 		default:
 			panic(fmt.Sprintf("Unhandled SCRUB option received: %+v", v))
 		}
@@ -140,7 +151,7 @@ func (n *scrubNode) Start(params runParams) error {
 		if err != nil {
 			return err
 		}
-		physical = true
+		n.physicalCheck = true
 	}
 
 	return nil
@@ -303,6 +314,43 @@ func scrubPlanAndRunDistSQL(
 	return rows, nil
 }
 
+// scrubPlanAndRunDistSQL will prepare and run the plan in distSQL. If a
+// RowContainer is returned the caller must close it.
+func scrubRunDistSQL(
+	ctx context.Context, planCtx *planningCtx, p *planner, plan *physicalPlan,
+) (*sqlbase.RowContainer, error) {
+	ci := sqlbase.ColTypeInfoFromColTypes(distsqlrun.ScrubTypes)
+	rows := sqlbase.NewRowContainer(*p.evalCtx.ActiveMemAcc, ci, 0)
+	rowResultWriter := NewRowResultWriter(parser.Rows, rows)
+	recv, err := makeDistSQLReceiver(
+		ctx,
+		rowResultWriter,
+		p.ExecCfg().RangeDescriptorCache,
+		p.ExecCfg().LeaseHolderCache,
+		p.txn,
+		func(ts hlc.Timestamp) {
+			_ = p.ExecCfg().Clock.Update(ts)
+		},
+	)
+	if err != nil {
+		return rows, err
+	}
+
+	err = p.session.distSQLPlanner.Run(planCtx, p.txn, plan, &recv, p.evalCtx)
+	if err != nil {
+		return rows, err
+	} else if recv.err != nil {
+		return rows, recv.err
+	}
+
+	if rows.Len() == 0 {
+		rows.Close(ctx)
+		return nil, nil
+	}
+
+	return rows, nil
+}
+
 // tableColumnsIsNullPredicate creates a predicate that checks if all of
 // the specified columns for a table are NULL. For example, given table
 // is t1 and the columns id, name, data, then the returned string is:
@@ -418,6 +466,86 @@ func createIndexCheckQuery(
 	)
 }
 
+// startPhysicalCheck will plan and run the physical data check using
+// the distSQL execution engine.
+func (n *scrubNode) startPhysicalCheck(
+	ctx context.Context,
+	p *planner,
+	tableDesc *sqlbase.TableDescriptor,
+	indexDesc sqlbase.IndexDescriptor,
+) (*physicalCheck, error) {
+	// Collect all of the columns, their types, and their IDs.
+	var columns []*sqlbase.ColumnDescriptor
+	var columnIDs []parser.ColumnID
+
+	if indexDesc.ID == tableDesc.PrimaryIndex.ID {
+		for i := range tableDesc.Columns {
+			columns = append(columns, &tableDesc.Columns[i])
+			columnIDs = append(columnIDs, parser.ColumnID(tableDesc.Columns[i].ID))
+
+		}
+	} else {
+		return nil, errors.Errorf("Physical check not implemented for secondary indexes")
+		// columns, _, _ = getColumns(tableDesc, indexDesc)
+		// for _, col := range columns {
+		// 	columnIDs = append(columnIDs, parser.ColumnID(col.ID))
+		// }
+	}
+
+	// Find the row indexes for all of the primary index columns.
+	primaryColIdxs, err := getPrimaryColIdxs(tableDesc, columns)
+	if err != nil {
+		return nil, err
+	}
+
+	indexHints := &parser.IndexHints{
+		IndexID:     parser.IndexID(indexDesc.ID),
+		NoIndexJoin: true,
+	}
+	scan := p.Scan()
+	scan.isCheck = true
+	if err := scan.initTable(p, tableDesc, indexHints, publicColumns, columnIDs); err != nil {
+		return nil, err
+	}
+	plan := planNode(scan)
+
+	// Optimize the plan. This is required in order to populate scanNode
+	// spans.
+	plan, err = p.optimizePlan(ctx, plan, allColumns(plan))
+	if err != nil {
+		plan.Close(ctx)
+		return nil, err
+	}
+	defer plan.Close(ctx)
+
+	scan = plan.(*scanNode)
+
+	span := tableDesc.IndexSpan(indexDesc.ID)
+	spans := []roachpb.Span{span}
+
+	planCtx := p.session.distSQLPlanner.newPlanningCtx(ctx, p.txn)
+	physicalPlan, err := p.session.distSQLPlanner.createScrubPhysicalCheck(
+		&planCtx, scan, *tableDesc, indexDesc, spans, p.ExecCfg().Clock.Now())
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := scrubRunDistSQL(ctx, &planCtx, p, &physicalPlan)
+	if err != nil {
+		rows.Close(ctx)
+		return nil, err
+	} else if rows == nil {
+		return nil, nil
+	}
+
+	return &physicalCheck{
+		rows:                      rows,
+		indexName:                 indexDesc.Name,
+		primaryIndexColumnIndexes: primaryColIdxs,
+		columns:                   columns,
+	}, nil
+}
+
 // indexesToCheck will return all of the indexes that are being checked.
 // If indexNames is nil, then all indexes are returned.
 // TODO(joey): This can be simplified with
@@ -487,6 +615,33 @@ func (n *scrubNode) Next(params runParams) (bool, error) {
 		return true, nil
 	}
 
+	// Begin the physical check query. It is planned then executed in the
+	// distSQL execution engine.
+	if n.physicalCheck && n.currentPhysicalCheck == nil {
+		n.currentPhysicalCheck, err = n.startPhysicalCheck(
+			params.ctx, params.p, n.tableDesc, n.tableDesc.PrimaryIndex)
+		if err != nil {
+			return false, err
+		}
+		n.physicalCheck = false
+	}
+
+	// If an physical check query is in progress then we will pull the rows
+	// from its buffer.
+	if n.currentPhysicalCheck != nil {
+		resultRow := n.currentPhysicalCheck.rows.At(n.currentPhysicalCheck.rowIndex)
+		n.row, err = n.getNextPhysicalError(params.p, n.currentPhysicalCheck, resultRow)
+		if err != nil {
+			return false, err
+		}
+		n.currentPhysicalCheck.rowIndex++
+		if n.currentPhysicalCheck.rowIndex >= n.currentPhysicalCheck.rows.Len() {
+			n.currentPhysicalCheck.rows.Close(params.ctx)
+			n.currentPhysicalCheck = nil
+		}
+		return true, nil
+	}
+
 	return false, nil
 }
 
@@ -524,9 +679,9 @@ func getNextIndexError(
 
 	var errorType parser.Datum
 	if isMissingIndexReferenceError {
-		errorType = parser.NewDString(ScrubErrorMissingIndexEntry)
+		errorType = parser.NewDString(scrub.MissingIndexEntryError)
 	} else {
-		errorType = parser.NewDString(ScrubErrorDanglingIndexReference)
+		errorType = parser.NewDString(scrub.DanglingIndexReferenceError)
 	}
 
 	details := make(map[string]interface{})
@@ -562,6 +717,41 @@ func getNextIndexError(
 		parser.NewDString(currentIndex.databaseName),
 		parser.NewDString(currentIndex.tableName),
 		primaryKey,
+		timestamp,
+		parser.DBoolFalse,
+		detailsJSON,
+	}, nil
+}
+
+// getNextPhysicalError will translate an row returned from a physical
+// error and generate the corresponding SCRUB result row. The schema of
+// row is in sqlbase.ScrubTypes.
+func (n *scrubNode) getNextPhysicalError(
+	p *planner, currentPhysical *physicalCheck, row parser.Datums,
+) (parser.Datums, error) {
+
+	timestamp := parser.MakeDTimestamp(
+		p.evalCtx.GetStmtTimestamp(), time.Nanosecond)
+
+	details, ok := row[2].(*parser.DString)
+	if !ok {
+		return nil, errors.Errorf("expected row value 3 to be DString, got: %T", row[2])
+	}
+
+	// TODO(joey): This is required because there is currently no JSON
+	// column type. As a result we have to stream it as a string.
+	detailsJSON, err := parser.ParseDJSON(string(*details))
+	if err != nil {
+		return nil, err
+	}
+
+	return parser.Datums{
+		// TODO(joey): Add the job UUID once the SCRUB command uses jobs.
+		parser.DNull, /* job_uuid */
+		row[0],       /* errorType */
+		parser.NewDString(n.tableName.Database()),
+		parser.NewDString(n.tableName.Table()),
+		row[1], /* primaryKey */
 		timestamp,
 		parser.DBoolFalse,
 		detailsJSON,
