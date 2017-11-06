@@ -75,6 +75,10 @@ type scanNode struct {
 	lockForUpdate    bool
 	props            physicalProps
 
+	// Indicates if this scanNode will do a physical data check. This is
+	// only true when running SCRUB commands.
+	isCheck bool
+
 	rowIndex int64 // the index of the current row
 
 	// filter that can be evaluated using only this table/index; it contains
@@ -133,7 +137,7 @@ func (n *scanNode) disableBatchLimit() {
 
 func (n *scanNode) Start(runParams) error {
 	return n.fetcher.Init(n.desc, n.colIdxMap, n.index, n.reverse, n.lockForUpdate, n.isSecondaryIndex,
-		n.cols, n.valNeededForCol, false /* returnRangeInfo */, &n.p.alloc)
+		n.cols, n.valNeededForCol, false /* returnRangeInfo */, false /* isCheck */, &n.p.alloc)
 }
 
 func (n *scanNode) Close(context.Context) {
