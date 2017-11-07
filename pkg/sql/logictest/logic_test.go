@@ -219,7 +219,7 @@ var (
 		"do not fail when a test expects a column of a numeric type but the query provides another type",
 	)
 	scrubMode = flag.Bool(
-		"scrub", false,
+		"scrub", true,
 		"run SCRUB DATABASE between each logic test operation",
 	)
 
