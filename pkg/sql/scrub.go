@@ -122,8 +122,15 @@ func (n *scrubNode) Start(params runParams) error {
 
 	// Process SCRUB options.
 	var indexesSet bool
+	var constraintsSet bool
 	for _, option := range n.n.Options {
 		switch v := option.(type) {
+		case *parser.ScrubOptionConstraint:
+			if constraintsSet {
+				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
+					"cannot specify CONSTRAINT option more than once")
+			}
+			constraintsSet = true
 		case *parser.ScrubOptionIndex:
 			if indexesSet {
 				return pgerror.NewErrorf(pgerror.CodeSyntaxError,
