@@ -218,6 +218,10 @@ var (
 		"flex-types", false,
 		"do not fail when a test expects a column of a numeric type but the query provides another type",
 	)
+	scrubMode = flag.Bool(
+		"scrub", false,
+		"run SCRUB DATABASE between each logic test operation",
+	)
 
 	// Output parameters
 	showSQL = flag.Bool("show-sql", false,
@@ -312,6 +316,21 @@ func (l *lineScanner) Scan() bool {
 		l.line++
 	}
 	return ok
+}
+
+type scrubResult struct {
+	errorType  string
+	database   string
+	table      string
+	primaryKey string
+	timestamp  time.Time
+	repaired   bool
+	details    string
+}
+
+func (s scrubResult) String() string {
+	return fmt.Sprintf("error=%q database=%q table=%q primaryKey=%s details=%s",
+		s.errorType, s.database, s.table, s.primaryKey, s.details)
 }
 
 // logicStatement represents a single statement test in Test-Script.
@@ -845,6 +864,12 @@ func (t *logicTest) processTestFile(path string, config testClusterConfig) error
 		if len(fields) == 2 && fields[1] == "error" {
 			return fmt.Errorf("%s:%d: no expected error provided", path, s.line)
 		}
+		if *scrubMode {
+			if err := t.execScrub(); !testutils.IsError(err, "only root is allowed to SCRUB") &&
+				err != nil {
+				t.Error(err)
+			}
+		}
 		switch cmd {
 		case "repeat":
 			// A line "repeat X" makes the test repeat the following statement or query X times.
@@ -1260,6 +1285,46 @@ func (t *logicTest) hashResults(results []string) (string, error) {
 		}
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+func (t *logicTest) execScrub() error {
+	rows, err := t.db.Query("EXPERIMENTAL SCRUB DATABASE test")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var results []scrubResult
+	var unused *string
+	for rows.Next() {
+		result := scrubResult{}
+		if err := rows.Scan(
+			// TODO(joey): In the future, SCRUB will run as a job during execution.
+			&unused, /* job_uuid */
+			&result.errorType,
+			&result.database,
+			&result.table,
+			&result.primaryKey,
+			&result.timestamp,
+			&result.repaired,
+			&result.details,
+		); err != nil {
+			return err
+		}
+		results = append(results, result)
+	}
+
+	if rows.Err() != nil {
+		return err
+	} else if len(results) > 0 {
+		var buf bytes.Buffer
+		buf.WriteString("SCRUB check failed during test, got errors:")
+		for _, result := range results {
+			fmt.Fprintf(&buf, "\n%v", result)
+		}
+		return errors.New(buf.String())
+	}
+	return nil
 }
 
 func (t *logicTest) execQuery(query logicQuery) error {
