@@ -248,6 +248,12 @@ func (n *scrubNode) startScrubTable(
 					"cannot specify CONSTRAINT option more than once")
 			}
 			constraintsSet = true
+			constraintsToCheck, err := createConstraintCheckOperations(
+				ctx, p, v.ConstraintNames, tableDesc, tableName)
+			if err != nil {
+				return err
+			}
+			n.run.checkQueue = append(n.run.checkQueue, constraintsToCheck...)
 		default:
 			panic(fmt.Sprintf("Unhandled SCRUB option received: %+v", v))
 		}
@@ -261,6 +267,14 @@ func (n *scrubNode) startScrubTable(
 			return err
 		}
 		n.run.checkQueue = append(n.run.checkQueue, indexesToCheck...)
+
+		constraintsToCheck, err := createConstraintCheckOperations(
+			ctx, p, nil /* constraintNames */, tableDesc, tableName)
+		if err != nil {
+			return err
+		}
+		n.run.checkQueue = append(n.run.checkQueue, constraintsToCheck...)
+
 		// TODO(joey): Initialize physical index to check.
 	}
 
@@ -718,15 +732,15 @@ func scrubPlanDistSQL(
 	log.VEvent(ctx, 1, "creating DistSQL plan")
 	physPlan, err := p.session.distSQLPlanner.createPlanForNode(planCtx, plan)
 	if err != nil {
-		return nil, err
+	a	return nil, err
 	}
 	p.session.distSQLPlanner.FinalizePlan(planCtx, &physPlan)
 
 	return &physPlan, err
 }
 
-// scrubRunDistSQL run a distSQLPhysicalPlan plan in distSQL. If a
-// RowContainer is returned the caller must close it.
+// scrubRunDistSQL run a distSQLPhysicalPlan plan in distSQL. If
+// RowContainer is returned, the caller must close it.
 func scrubRunDistSQL(
 	ctx context.Context,
 	planCtx *planningCtx,
