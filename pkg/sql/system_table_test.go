@@ -116,6 +116,7 @@ func TestSystemTableLiterals(t *testing.T) {
 		{keys.RangeEventTableID, sqlbase.RangeEventTableSchema, sqlbase.RangeEventTable},
 		{keys.UITableID, sqlbase.UITableSchema, sqlbase.UITable},
 		{keys.JobsTableID, sqlbase.JobsTableSchema, sqlbase.JobsTable},
+		{keys.ScrubErrorsTableID, sqlbase.ScrubErrorsTableSchema, sqlbase.ScrubErrorsTable},
 		{keys.SettingsTableID, sqlbase.SettingsTableSchema, sqlbase.SettingsTable},
 		{keys.WebSessionsTableID, sqlbase.WebSessionsTableSchema, sqlbase.WebSessionsTable},
 	} {

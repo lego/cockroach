@@ -122,6 +122,20 @@ CREATE TABLE system.jobs (
 	FAMILY (id, status, created, payload)
 );`
 
+	// FIXME(joey): Change details to JSONB.
+	ScrubErrorsTableSchema = `
+CREATE TABLE system.scrub_errors (
+	id                INT       DEFAULT unique_rowid() PRIMARY KEY,
+	job_uuid          UUID,
+	error_type        STRING    NOT NULL,
+	database          STRING    NOT NULL,
+  table             STRING    NOT NULL,
+	primary_key       STRING,
+	timestamp         TIMESTAMP NOT NULL,
+	repaired          BOOL      NOT NULL,
+	details           STRING
+);`
+
 	// web_sessions are used to track authenticated user actions over stateless
 	// connections, such as the cookie-based authentication used by the Admin
 	// UI.
@@ -612,6 +626,33 @@ var (
 		},
 		NextMutationID: 1,
 		FormatVersion:  3,
+	}
+
+	// ScrubErrorsTable is the descriptor for the jobs table.
+	ScrubErrorsTable = TableDescriptor{
+		Name:     "scrub_errors",
+		ID:       keys.ScrubErrorsTableID,
+		ParentID: 1,
+		Version:  1,
+		Columns: []ColumnDescriptor{
+			{Name: "id", ID: 1, Type: colTypeInt, DefaultExpr: &uniqueRowIDString},
+			{Name: "job_uuid", ID: 2, Type: ColumnType{SemanticType: ColumnType_UUID}, Nullable: true},
+			{Name: "error_type", ID: 3, Type: colTypeString},
+			{Name: "database", ID: 5, Type: colTypeString},
+			{Name: "table", ID: 6, Type: colTypeString},
+			{Name: "primary_key", ID: 7, Type: colTypeString, Nullable: true},
+			{Name: "timestamp", ID: 8, Type: colTypeTimestamp},
+			{Name: "repaired", ID: 9, Type: ColumnType{SemanticType: ColumnType_BOOL}},
+			{Name: "details", ID: 10, Type: colTypeString, Nullable: true},
+		},
+		NextColumnID:   11,
+		NextFamilyID:   0,
+		PrimaryIndex:   pk("id"),
+		Indexes:        nil,
+		NextIndexID:    2,
+		Privileges:     NewPrivilegeDescriptor(security.RootUser, SystemDesiredPrivileges(keys.ScrubErrorsTableID)),
+		FormatVersion:  InterleavedFormatVersion,
+		NextMutationID: 1,
 	}
 )
 
