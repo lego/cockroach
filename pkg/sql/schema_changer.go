@@ -1139,9 +1139,7 @@ func (s *schemaChangeResumer) OnFailOrCancel(
 
 // FIXME(joey): Attempt to kick-start job dependancies. Ideally this is
 // done through a built-in job dependancy spec.
-func (s *schemaChangeResumer) OnSuccess(
-	ctx context.Context, txn *client.Txn, job *jobs.Job,
-) error {
+func (s *schemaChangeResumer) OnSuccess(ctx context.Context, txn *client.Txn, job *jobs.Job) error {
 	details := job.Record.Details.(jobs.SchemaChangeDetails)
 	log.Errorf(ctx, "Schema change OnSuccess. Details=%#v", details)
 	return nil
