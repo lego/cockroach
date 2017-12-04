@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
@@ -987,6 +988,11 @@ type txnState struct {
 	// The schema change closures to run when this txn is done.
 	schemaChangers schemaChangerCollection
 
+	schemaChangers []struct {
+		mutationID MutationID
+		jobID      int64
+	}
+
 	sp opentracing.Span
 
 	// The timestamp to report for current_timestamp(), now() etc.
@@ -1332,9 +1338,35 @@ func (scc *schemaChangerCollection) execSchemaChanges(
 	var firstError error
 	for _, scEntry := range scc.schemaChangers {
 		sc := &scEntry.sc
-		sc.db = *e.cfg.DB
-		sc.testingKnobs = e.cfg.SchemaChangerTestingKnobs
-		sc.distSQLPlanner = e.distSQLPlanner
+
+		if len(session.TxnState.schemaChangeJobs) > 0 &&
+			session.TxnState.schemaChangeJobs[0].mutationID == sc.mutationID {
+			// Start the job asynchronously. It will do more work than just
+			// incremeneting the table descriptor.
+		}
+
+		// Find our job.
+		foundJobID := false
+		var job *jobs.Job
+		for _, g := range tableDesc.MutationJobs {
+			if g.MutationID == sc.mutationID {
+				job, err = session.jobRegistry.LoadJob(ctx, g.JobID)
+				if err != nil {
+					return err
+				}
+				foundJobID = true
+				break
+			}
+		}
+		if !foundJobID {
+			// No job means we've already run and completed this schema change
+			// successfully, so we can just exit.
+			return nil
+		}
+		_, errChan, err := session.jobRegistry.BeginJob(ctx, nil, job)
+		if err != nil {
+			return err
+		}
 		for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
 			evalCtx := createSchemaChangeEvalCtx(e.cfg.Clock.Now())
 			if err := sc.exec(ctx, true /* inSession */, evalCtx); err != nil {

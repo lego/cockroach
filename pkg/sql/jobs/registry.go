@@ -136,6 +136,30 @@ func (r *Registry) StartJob(
 	return j, errCh, nil
 }
 
+// BeginJob asynchronously starts a job that was already created. An
+// error is returned if the job type has not been registered with
+// AddResumeHook. The ctx passed to this function is not the context the
+// job will be started with (canceling ctx will not causing the job to
+// cancel).
+func (r *Registry) BeginJob(
+	ctx context.Context, resultsCh chan<- tree.Datums, j *Job,
+) (*Job, <-chan error, error) {
+	resumer, err := getResumeHook(detailsType(WrapPayloadDetails(j.Record.Details)), r.settings)
+	if err != nil {
+		return nil, nil, err
+	}
+	// FIXME(joey): The job may not have a lease at this point. Will this
+	// still work?
+	resumeCtx, cancel := r.makeCtx()
+	r.register(*j.id, cancel)
+	if err := j.Started(ctx); err != nil {
+		r.unregister(*j.id)
+		return nil, nil, err
+	}
+	errCh := r.resume(resumeCtx, resumer, resultsCh, j)
+	return j, errCh, nil
+}
+
 // NewJob creates a new Job.
 func (r *Registry) NewJob(record Record) *Job {
 	return &Job{

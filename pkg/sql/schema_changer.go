@@ -15,30 +15,23 @@
 package sql
 
 import (
-	"bytes"
 	"fmt"
-	"math"
 	"time"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
 	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -905,215 +898,146 @@ type SchemaChangerTestingKnobs struct {
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
 func (*SchemaChangerTestingKnobs) ModuleTestingKnobs() {}
 
-// SchemaChangeManager processes pending schema changes seen in gossip
-// updates. Most schema changes are executed synchronously by the node
-// that created the schema change. If the node dies while
-// processing the schema change this manager acts as a backup
-// execution mechanism.
-type SchemaChangeManager struct {
-	db           client.DB
-	gossip       *gossip.Gossip
-	leaseMgr     *LeaseManager
-	testingKnobs *SchemaChangerTestingKnobs
-	// Create a schema changer for every outstanding schema change seen.
-	schemaChangers map[sqlbase.ID]SchemaChanger
-	distSQLPlanner *DistSQLPlanner
-	clock          *hlc.Clock
-	jobRegistry    *jobs.Registry
-	// Caches updated by DistSQL.
-	rangeDescriptorCache *kv.RangeDescriptorCache
-	leaseHolderCache     *kv.LeaseHolderCache
-}
+// // Start starts a goroutine that runs outstanding schema changes
+// // for tables received in the latest system configuration via gossip.
+// func (s *SchemaChangeManager) Start(stopper *stop.Stopper) {
+// 	stopper.RunWorker(context.TODO(), func(ctx context.Context) {
+// 		descKeyPrefix := keys.MakeTablePrefix(uint32(sqlbase.DescriptorTable.ID))
+// 		gossipUpdateC := s.gossip.RegisterSystemConfigChannel()
+// 		timer := &time.Timer{}
+// 		delay := 360 * time.Second
+// 		if s.testingKnobs.AsyncExecQuickly {
+// 			delay = 20 * time.Millisecond
+// 		}
+// 		for {
+// 			select {
+// 			case <-gossipUpdateC:
+// 				cfg, _ := s.gossip.GetSystemConfig()
+// 				// Read all tables and their versions
+// 				if log.V(2) {
+// 					log.Info(ctx, "received a new config")
+// 				}
+// 				schemaChanger := SchemaChanger{
+// 					nodeID:               s.leaseMgr.nodeID.Get(),
+// 					db:                   s.db,
+// 					leaseMgr:             s.leaseMgr,
+// 					testingKnobs:         s.testingKnobs,
+// 					distSQLPlanner:       s.DistSQLPlanner,
+// 					jobRegistry:          s.jobRegistry,
+// 					leaseHolderCache:     s.leaseHolderCache,
+// 					rangeDescriptorCache: s.rangeDescriptorCache,
+// 					clock:                s.clock,
+// 				}
+// 				// Keep track of existing schema changers.
+// 				oldSchemaChangers := make(map[sqlbase.ID]struct{}, len(s.schemaChangers))
+// 				for k := range s.schemaChangers {
+// 					oldSchemaChangers[k] = struct{}{}
+// 				}
+// 				execAfter := timeutil.Now().Add(delay)
+// 				// Loop through the configuration to find all the tables.
+// 				for _, kv := range cfg.Values {
+// 					if !bytes.HasPrefix(kv.Key, descKeyPrefix) {
+// 						continue
+// 					}
+// Attempt to unmarshal config into a table/database descriptor.
+// var descriptor sqlbase.Descriptor
+// if err := kv.Value.GetProto(&descriptor); err != nil {
+// 	log.Warningf(ctx, "%s: unable to unmarshal descriptor %v", kv.Key, kv.Value)
+// 	continue
+// }
+// switch union := descriptor.Union.(type) {
+// case *sqlbase.Descriptor_Table:
+// 	table := union.Table
+// 	table.MaybeUpgradeFormatVersion()
+// 	if err := table.ValidateTable(); err != nil {
+// 		log.Errorf(ctx, "%s: received invalid table descriptor: %v", kv.Key, table)
+// 		continue
+// 	}
 
-// NewSchemaChangeManager returns a new SchemaChangeManager.
-func NewSchemaChangeManager(
-	st *cluster.Settings,
-	testingKnobs *SchemaChangerTestingKnobs,
-	db client.DB,
-	nodeDesc roachpb.NodeDescriptor,
-	rpcContext *rpc.Context,
-	distSQLServ *distsqlrun.ServerImpl,
-	distSender *kv.DistSender,
-	gossip *gossip.Gossip,
-	leaseMgr *LeaseManager,
-	clock *hlc.Clock,
-	jobRegistry *jobs.Registry,
-	dsp *DistSQLPlanner,
-	rangeDescriptorCache *kv.RangeDescriptorCache,
-	leaseHolderCache *kv.LeaseHolderCache,
-) *SchemaChangeManager {
-	return &SchemaChangeManager{
-		db:                   db,
-		gossip:               gossip,
-		leaseMgr:             leaseMgr,
-		testingKnobs:         testingKnobs,
-		schemaChangers:       make(map[sqlbase.ID]SchemaChanger),
-		distSQLPlanner:       dsp,
-		jobRegistry:          jobRegistry,
-		clock:                clock,
-		rangeDescriptorCache: rangeDescriptorCache,
-		leaseHolderCache:     leaseHolderCache,
-	}
-}
+// 	// Keep track of outstanding schema changes.
+// 	// If all schema change commands always set UpVersion, why
+// 	// check for the presence of mutations?
+// 	// A schema change execution might fail soon after
+// 	// unsetting UpVersion, and we still want to process
+// 	// outstanding mutations. Similar with a table marked for deletion.
+// 	if table.UpVersion || table.Dropped() || table.Adding() ||
+// 		table.Renamed() || len(table.Mutations) > 0 {
+// 		if log.V(2) {
+// 			log.Infof(ctx, "%s: queue up pending schema change; table: %d, version: %d",
+// 				kv.Key, table.ID, table.Version)
+// 		}
 
-// Creates a timer that is used by the manager to decide on
-// when to run the next schema changer.
-func (s *SchemaChangeManager) newTimer() *time.Timer {
-	waitDuration := time.Duration(math.MaxInt64)
-	now := timeutil.Now()
-	for _, sc := range s.schemaChangers {
-		d := sc.execAfter.Sub(now)
-		if d < waitDuration {
-			waitDuration = d
-		}
-	}
-	// Create a timer if there is an existing schema changer.
-	if len(s.schemaChangers) > 0 {
-		return time.NewTimer(waitDuration)
-	}
-	return &time.Timer{}
-}
+// 		// Only track the first schema change. We depend on
+// 		// gossip to renotify us when a schema change has been
+// 		// completed.
+// 		schemaChanger.tableID = table.ID
+// 		if len(table.Mutations) == 0 {
+// 			schemaChanger.mutationID = sqlbase.InvalidMutationID
+// 		} else {
+// 			schemaChanger.mutationID = table.Mutations[0].MutationID
+// 		}
+// 		schemaChanger.execAfter = execAfter
+// 		// Keep track of this schema change.
+// 		// Remove from oldSchemaChangers map.
+// 		delete(oldSchemaChangers, table.ID)
+// 		if sc, ok := s.schemaChangers[table.ID]; ok {
+// 			if sc.mutationID == schemaChanger.mutationID {
+// 				// Ignore duplicate.
+// 				continue
+// 			}
+// 		}
+// 		s.schemaChangers[table.ID] = schemaChanger
+// 	}
 
-// Start starts a goroutine that runs outstanding schema changes
-// for tables received in the latest system configuration via gossip.
-func (s *SchemaChangeManager) Start(stopper *stop.Stopper) {
-	stopper.RunWorker(context.TODO(), func(ctx context.Context) {
-		descKeyPrefix := keys.MakeTablePrefix(uint32(sqlbase.DescriptorTable.ID))
-		gossipUpdateC := s.gossip.RegisterSystemConfigChannel()
-		timer := &time.Timer{}
-		delay := 360 * time.Second
-		if s.testingKnobs.AsyncExecQuickly {
-			delay = 20 * time.Millisecond
-		}
-		for {
-			select {
-			case <-gossipUpdateC:
-				cfg, _ := s.gossip.GetSystemConfig()
-				// Read all tables and their versions
-				if log.V(2) {
-					log.Info(ctx, "received a new config")
-				}
-				schemaChanger := SchemaChanger{
-					nodeID:               s.leaseMgr.nodeID.Get(),
-					db:                   s.db,
-					leaseMgr:             s.leaseMgr,
-					testingKnobs:         s.testingKnobs,
-					distSQLPlanner:       s.distSQLPlanner,
-					jobRegistry:          s.jobRegistry,
-					leaseHolderCache:     s.leaseHolderCache,
-					rangeDescriptorCache: s.rangeDescriptorCache,
-					clock:                s.clock,
-				}
-				// Keep track of existing schema changers.
-				oldSchemaChangers := make(map[sqlbase.ID]struct{}, len(s.schemaChangers))
-				for k := range s.schemaChangers {
-					oldSchemaChangers[k] = struct{}{}
-				}
-				execAfter := timeutil.Now().Add(delay)
-				// Loop through the configuration to find all the tables.
-				for _, kv := range cfg.Values {
-					if !bytes.HasPrefix(kv.Key, descKeyPrefix) {
-						continue
-					}
-					// Attempt to unmarshal config into a table/database descriptor.
-					var descriptor sqlbase.Descriptor
-					if err := kv.Value.GetProto(&descriptor); err != nil {
-						log.Warningf(ctx, "%s: unable to unmarshal descriptor %v", kv.Key, kv.Value)
-						continue
-					}
-					switch union := descriptor.Union.(type) {
-					case *sqlbase.Descriptor_Table:
-						table := union.Table
-						table.MaybeUpgradeFormatVersion()
-						if err := table.ValidateTable(); err != nil {
-							log.Errorf(ctx, "%s: received invalid table descriptor: %v", kv.Key, table)
-							continue
-						}
+// case *sqlbase.Descriptor_Database:
+// 						// Ignore.
+// 					}
+// 				}
+// 				// Delete old schema changers.
+// 				for k := range oldSchemaChangers {
+// 					delete(s.schemaChangers, k)
+// 				}
+// 				timer = s.newTimer()
 
-						// Keep track of outstanding schema changes.
-						// If all schema change commands always set UpVersion, why
-						// check for the presence of mutations?
-						// A schema change execution might fail soon after
-						// unsetting UpVersion, and we still want to process
-						// outstanding mutations. Similar with a table marked for deletion.
-						if table.UpVersion || table.Dropped() || table.Adding() ||
-							table.Renamed() || len(table.Mutations) > 0 {
-							if log.V(2) {
-								log.Infof(ctx, "%s: queue up pending schema change; table: %d, version: %d",
-									kv.Key, table.ID, table.Version)
-							}
+// 			case <-timer.C:
+// 				if s.testingKnobs.AsyncExecNotification != nil &&
+// 					s.testingKnobs.AsyncExecNotification() != nil {
+// 					timer = s.newTimer()
+// 					continue
+// 				}
+// for tableID, sc := range s.schemaChangers {
+// 	if timeutil.Since(sc.execAfter) > 0 {
+// 		evalCtx := createSchemaChangeEvalCtx(s.clock.Now())
+// 		// TODO(andrei): create a proper ctx for executing schema changes.
+// 		if err := sc.exec(ctx, false /* inSession */, evalCtx); err != nil {
+// 			if shouldLogSchemaChangeError(err) {
+// 				log.Warningf(ctx, "Error executing schema change: %s", err)
+// 			}
+// 			if err == sqlbase.ErrDescriptorNotFound {
+// 				// Someone deleted this table. Don't try to run the schema
+// 				// changer again. Note that there's no gossip update for the
+// 				// deletion which would remove this schemaChanger.
+// 				delete(s.schemaChangers, tableID)
+// 			}
+// 		} else {
+// 			// We successfully executed the schema change. Delete it.
+// 			delete(s.schemaChangers, tableID)
+// 		}
+// 		// Advance the execAfter time so that this schema
+// 		// changer doesn't get called again for a while.
+// 		sc.execAfter = timeutil.Now().Add(delay)
+// 	}
+// 	// Only attempt to run one schema changer.
+// 	break
+// }
+// 				timer = s.newTimer()
 
-							// Only track the first schema change. We depend on
-							// gossip to renotify us when a schema change has been
-							// completed.
-							schemaChanger.tableID = table.ID
-							if len(table.Mutations) == 0 {
-								schemaChanger.mutationID = sqlbase.InvalidMutationID
-							} else {
-								schemaChanger.mutationID = table.Mutations[0].MutationID
-							}
-							schemaChanger.execAfter = execAfter
-							// Keep track of this schema change.
-							// Remove from oldSchemaChangers map.
-							delete(oldSchemaChangers, table.ID)
-							if sc, ok := s.schemaChangers[table.ID]; ok {
-								if sc.mutationID == schemaChanger.mutationID {
-									// Ignore duplicate.
-									continue
-								}
-							}
-							s.schemaChangers[table.ID] = schemaChanger
-						}
-
-					case *sqlbase.Descriptor_Database:
-						// Ignore.
-					}
-				}
-				// Delete old schema changers.
-				for k := range oldSchemaChangers {
-					delete(s.schemaChangers, k)
-				}
-				timer = s.newTimer()
-
-			case <-timer.C:
-				if s.testingKnobs.AsyncExecNotification != nil &&
-					s.testingKnobs.AsyncExecNotification() != nil {
-					timer = s.newTimer()
-					continue
-				}
-				for tableID, sc := range s.schemaChangers {
-					if timeutil.Since(sc.execAfter) > 0 {
-						evalCtx := createSchemaChangeEvalCtx(s.clock.Now())
-						// TODO(andrei): create a proper ctx for executing schema changes.
-						if err := sc.exec(ctx, false /* inSession */, evalCtx); err != nil {
-							if shouldLogSchemaChangeError(err) {
-								log.Warningf(ctx, "Error executing schema change: %s", err)
-							}
-							if err == sqlbase.ErrDescriptorNotFound {
-								// Someone deleted this table. Don't try to run the schema
-								// changer again. Note that there's no gossip update for the
-								// deletion which would remove this schemaChanger.
-								delete(s.schemaChangers, tableID)
-							}
-						} else {
-							// We successfully executed the schema change. Delete it.
-							delete(s.schemaChangers, tableID)
-						}
-						// Advance the execAfter time so that this schema
-						// changer doesn't get called again for a while.
-						sc.execAfter = timeutil.Now().Add(delay)
-					}
-					// Only attempt to run one schema changer.
-					break
-				}
-				timer = s.newTimer()
-
-			case <-stopper.ShouldStop():
-				return
-			}
-		}
-	})
-}
+// 			case <-stopper.ShouldStop():
+// 				return
+// 			}
+// 		}
+// 	})
+// }
 
 // createSchemaChangeEvalCtx creates an EvalContext to be used for backfills.
 //
@@ -1147,4 +1071,113 @@ func createSchemaChangeEvalCtx(ts hlc.Timestamp) tree.EvalContext {
 	evalCtx.SetClusterTimestamp(ts)
 
 	return evalCtx
+}
+
+var _ jobs.Resumer = &schemaChangeResumer{}
+
+type schemaChangeResumer struct {
+	settings       *cluster.Settings
+	testingKnobs   *SchemaChangerTestingKnobs
+	db             client.DB
+	leaseMgr       *LeaseManager
+	DistSQLPlanner *DistSQLPlanner
+	clock          *hlc.Clock
+	jobRegistry    *jobs.Registry
+	// Caches updated by DistSQL.
+	rangeDescriptorCache *kv.RangeDescriptorCache
+	leaseHolderCache     *kv.LeaseHolderCache
+}
+
+func (s *schemaChangeResumer) Resume(
+	ctx context.Context, job *jobs.Job, resultsCh chan<- tree.Datums,
+) error {
+	details := job.Record.Details.(jobs.SchemaChangeDetails)
+	log.Errorf(ctx, "Schema change Resume. Details=%#v", details)
+
+	schemaChanger := SchemaChanger{
+		nodeID:               s.leaseMgr.nodeID.Get(),
+		db:                   s.db,
+		leaseMgr:             s.leaseMgr,
+		testingKnobs:         s.testingKnobs,
+		distSQLPlanner:       s.DistSQLPlanner,
+		clock:                s.clock,
+		jobRegistry:          s.jobRegistry,
+		leaseHolderCache:     s.leaseHolderCache,
+		rangeDescriptorCache: s.rangeDescriptorCache,
+	}
+
+	evalCtx := createSchemaChangeEvalCtx(s.clock.Now())
+	// TODO(andrei): create a proper ctx for executing schema changes.
+	if err := schemaChanger.exec(ctx, false /* inSession */, evalCtx); err != nil {
+		if shouldLogSchemaChangeError(err) {
+			log.Warningf(ctx, "Error executing schema change: %s", err)
+		}
+		if err == sqlbase.ErrDescriptorNotFound {
+			// Someone deleted this table. Don't try to run the schema
+			// changer again.
+		}
+	} else {
+		// We successfully executed the schema change.
+	}
+	// FIXME(joey): Retry this schema change after X amount of time, as we
+	// ran into a retry-able error. Look into using utils/retry.
+
+	return nil
+}
+
+// FIXME(joey): Attempt to kick-start job dependancies. Ideally this is
+// done through a built-in job dependancy spec.
+// FIXME(joey): Begin a rollback job.
+// FIXME(joey): What happens if a rollback fails or is canceled?
+func (s *schemaChangeResumer) OnFailOrCancel(
+	ctx context.Context, txn *client.Txn, job *jobs.Job,
+) error {
+	details := job.Record.Details.(jobs.SchemaChangeDetails)
+	log.Errorf(ctx, "Schema change OnFailorCancel. Details=%#v", details)
+	return nil
+}
+
+// FIXME(joey): Attempt to kick-start job dependancies. Ideally this is
+// done through a built-in job dependancy spec.
+func (s *schemaChangeResumer) OnSuccess(
+	ctx context.Context, txn *client.Txn, job *jobs.Job,
+) error {
+	details := job.Record.Details.(jobs.SchemaChangeDetails)
+	log.Errorf(ctx, "Schema change OnSuccess. Details=%#v", details)
+	return nil
+}
+
+// FIXME(joey): Return a status to the client?
+func (s *schemaChangeResumer) OnTerminal(
+	ctx context.Context, job *jobs.Job, status jobs.Status, resultsCh chan<- tree.Datums,
+) {
+	details := job.Record.Details.(jobs.SchemaChangeDetails)
+	log.Errorf(ctx, "Schema change OnTerminal. Details=%#v", details)
+}
+
+func InitSchemaChangeJobControl(
+	st *cluster.Settings,
+	testingKnobs *SchemaChangerTestingKnobs,
+	db client.DB,
+	leaseMgr *LeaseManager,
+	dsp *DistSQLPlanner,
+	clock *hlc.Clock,
+	jobRegistry *jobs.Registry,
+	rangeDescriptorCache *kv.RangeDescriptorCache,
+	leaseHolderCache *kv.LeaseHolderCache,
+) {
+	fn := func(typ jobs.Type, settings *cluster.Settings) jobs.Resumer {
+		return &schemaChangeResumer{
+			settings:             st,
+			testingKnobs:         testingKnobs,
+			db:                   db,
+			leaseMgr:             leaseMgr,
+			DistSQLPlanner:       dsp,
+			clock:                clock,
+			jobRegistry:          jobRegistry,
+			rangeDescriptorCache: rangeDescriptorCache,
+			leaseHolderCache:     leaseHolderCache,
+		}
+	}
+	jobs.AddResumeHook(fn)
 }

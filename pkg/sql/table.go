@@ -620,6 +620,13 @@ func (p *planner) createSchemaChangeJob(
 	}
 	tableDesc.MutationJobs = append(tableDesc.MutationJobs, sqlbase.TableDescriptor_MutationJob{
 		MutationID: mutationID, JobID: *job.ID()})
+
+	// FIXME(joey): We need to also track jobIDs in the session.
+	p.session.TxnState.schemaChangeJobs = append(p.session.TxnState.schemaChangeJobs,
+		struct {
+			mutationID MutationID
+			jobID int64
+		}{mutationID, *job.ID())
 	return mutationID, nil
 }
 

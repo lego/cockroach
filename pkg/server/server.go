@@ -1085,22 +1085,17 @@ If problems persist, please see ` + base.DocsURL("cluster-setup-troubleshooting.
 		distSQLPlannerKnobs,
 	)
 
-	sql.NewSchemaChangeManager(
+	sql.InitSchemaChangeJobControl(
 		s.st,
 		testingKnobs,
 		*s.db,
-		s.node.Descriptor,
-		s.rpcContext,
-		s.distSQLServer,
-		s.distSender,
-		s.gossip,
 		s.leaseMgr,
+		distSQLPlanner,
 		s.clock,
 		s.jobRegistry,
-		distSQLPlanner,
 		s.distSender.RangeDescriptorCache(),
 		s.distSender.LeaseHolderCache(),
-	).Start(s.stopper)
+	)
 
 	s.sqlExecutor.Start(ctx, &s.adminMemMetrics, distSQLPlanner)
 	s.distSQLServer.Start()
