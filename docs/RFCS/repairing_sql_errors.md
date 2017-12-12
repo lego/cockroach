@@ -21,6 +21,10 @@ In short, the strategy discussed for how repairing is done is to first
 attempt to do a non-destructive fix, otherwise delete the bad data from
 the database.
 
+An alternative is also presented where the repair command does not made
+any modifications to the database, but instead provides the operators
+with the SQL commands to do the repairing.
+
 [scrub command rfc]: 20171025_scrub_sql_consistency_check_command.md
 
 
@@ -346,6 +350,46 @@ previously found, which make this feature difficult or undesirable. In
 particular, if the error was already fixed. Attempting to repair a fixed
 error could impact existing user data.
 
+
+### [3] Provide operators with repair statements
+
+Instead of repairing the errors automatically, the repair command can
+present to the user a set of statements that they need to run to fix the
+repair. This makes it very easy to do it and also has failure handling (i.e.
+human response). This also solves a number of the unresolved questions,
+including: letting the operator make additional changes to the repair
+within the same transaction, and let them address any destructive
+repairs before actually making the changes.
+
+It will be very important to have documentation describing what they
+need to do, what they should do, and what they should be aware of. I see
+this document as a good start for that.
+
+In order to do this at all though, we will need to have an answer for
+fixing errors that can't be fixed via. SQL commands. The only ones I can
+think of are broken indexes or bad keys. Other errors which come close
+to this are NULL in non-nullable columns and bad value encoding as these
+won't be readable, but they can be deleted directly (as far as I know, I
+might be wrong).
+
+As a suggestion (albeit, not a great one), we could introduce a scrub
+repair command to fix these specific issues. This is in the case that we
+don't have any other way a user can fix these issues since I don't have
+a better suggestion. For example:
+
+```sql
+# This will delete any dangling index references or generate a missing index reference, which cannot be repaired otherwise.
+SCRUB REPAIR INDEX <index_name> VALUES (<value>...)
+
+# This will remove a bad key that cannot be deleted otherwise.
+SCRUB REPAIR DELETE KEY 'some/key/string'
+```
+
+(Deleting keys directly seems extremely risky. But if these are only
+suggested operations, this should be okay?)
+
+I will be a lot more satisfied with this strategy once if there is an
+answer for that problem that we agree on.
 
 # Unresolved questions
 
